@@ -1,5 +1,19 @@
 import os
 import streamlit as st
+from PIL import Image
+
+# ------------------------------
+# PAGE CONFIG (MUST BE FIRST)
+# ------------------------------
+
+st.set_page_config(
+    page_title="AI-Sport Knowledge Assistant",
+    layout="wide"
+)
+
+# ------------------------------
+# IMPORTS
+# ------------------------------
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,18 +26,80 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_groq import ChatGroq
 
 
-# -------------------------
+# ------------------------------
 # CONFIG
-# -------------------------
+# ------------------------------
 
 DOCS_PATH = "docs"
 ACCESS_CODE = "company123"
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# -------------------------
+
+# ------------------------------
+# LOAD LOGO
+# ------------------------------
+
+LOGO = None
+
+if os.path.exists("logo.png"):
+    try:
+        LOGO = Image.open("logo.png")
+    except:
+        LOGO = None
+
+
+# ------------------------------
+# LOGIN SYSTEM
+# ------------------------------
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+
+def login():
+
+    st.title("🔐 AI-Sport Secure Access")
+
+    st.markdown("Enter your company access code to continue.")
+
+    access_code = st.text_input("Company Access Code", type="password")
+
+    if st.button("Login"):
+
+        if access_code == ACCESS_CODE:
+            st.session_state.authenticated = True
+            st.rerun()
+
+        else:
+            st.error("Invalid access code")
+
+
+if not st.session_state.authenticated:
+    login()
+    st.stop()
+
+
+# ------------------------------
+# HEADER / BRANDING
+# ------------------------------
+
+col1, col2 = st.columns([1, 5])
+
+with col1:
+    if LOGO:
+        st.image(LOGO, width=120)
+
+with col2:
+    st.title("AI-Sport Knowledge Assistant")
+    st.caption("AI-Sport Internal Support Chatbot")
+
+st.divider()
+
+
+# ------------------------------
 # LOAD VECTOR STORE
-# -------------------------
+# ------------------------------
 
 @st.cache_resource
 def load_vector_store():
@@ -31,7 +107,9 @@ def load_vector_store():
     documents = []
 
     for file in os.listdir(DOCS_PATH):
+
         if file.endswith(".pdf"):
+
             loader = PyPDFLoader(os.path.join(DOCS_PATH, file))
             documents.extend(loader.load())
 
@@ -51,9 +129,9 @@ def load_vector_store():
     return vectorstore
 
 
-# -------------------------
+# ------------------------------
 # LOAD LLM
-# -------------------------
+# ------------------------------
 
 def load_llm():
 
@@ -64,25 +142,9 @@ def load_llm():
     )
 
 
-# -------------------------
-# STREAMLIT UI
-# -------------------------
-
-st.set_page_config(page_title="Company Knowledge Chatbot")
-
-st.title("📚 Company Knowledge Chatbot")
-
-st.sidebar.title("Access")
-
-access = st.sidebar.text_input(
-    "Company Access Code",
-    type="password"
-)
-
-if access != ACCESS_CODE:
-    st.warning("Enter the company access code")
-    st.stop()
-
+# ------------------------------
+# LOAD COMPONENTS
+# ------------------------------
 
 vectorstore = load_vector_store()
 retriever = vectorstore.as_retriever()
@@ -90,9 +152,19 @@ retriever = vectorstore.as_retriever()
 llm = load_llm()
 
 
+# ------------------------------
+# PROMPT TEMPLATE
+# ------------------------------
+
 prompt = ChatPromptTemplate.from_template(
 """
-Answer the question using the context below.
+You are AI-Sport, the internal company support assistant.
+
+Answer ONLY using the provided documentation.
+
+If the answer cannot be found in the documents, respond with:
+
+"Please consult with your regional head operator for further assistance."
 
 Context:
 {context}
@@ -114,25 +186,92 @@ rag_chain = (
 )
 
 
+# ------------------------------
+# CHAT MEMORY
+# ------------------------------
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 
-query = st.chat_input("Ask about the documents")
+# ------------------------------
+# DISPLAY CHAT HISTORY
+# ------------------------------
+
+for message in st.session_state.messages:
+
+    if message["role"] == "assistant":
+
+        with st.chat_message("assistant", avatar=LOGO):
+            st.markdown(message["content"])
+
+    else:
+
+        with st.chat_message("user"):
+            st.markdown(message["content"])
+
+
+# ------------------------------
+# CHAT INPUT
+# ------------------------------
+
+query = st.chat_input("Ask AI-Sport about the system...")
 
 if query:
 
-    response = rag_chain.invoke(query)
-
-    st.session_state.messages.append(
-        {"user": query, "bot": response.content}
-    )
-
-
-for msg in st.session_state.messages:
+    st.session_state.messages.append({
+        "role": "user",
+        "content": query
+    })
 
     with st.chat_message("user"):
-        st.write(msg["user"])
+        st.markdown(query)
 
-    with st.chat_message("assistant"):
-        st.write(msg["bot"])
+    user_input = query.lower()
+
+    # ------------------------------
+    # SMALL TALK RESPONSES
+    # ------------------------------
+
+    small_talk = {
+        "hi": "Hello! I'm AI-Sport, your internal support assistant. How can I help you today?",
+        "hello": "Hello! How can I assist you with the AI-Sport system today?",
+        "hey": "Hey there! What would you like help with?",
+        "thanks": "You're welcome! Let me know if you need anything else.",
+        "thank": "You're welcome! I'm here to help.",
+        "how are you": "I'm running perfectly and ready to help with AI-Sport support questions.",
+        "good morning": "Good morning! How can I assist you today?",
+        "good afternoon": "Good afternoon! What can I help you with?",
+        "good evening": "Good evening! How can I assist you today?"
+    }
+
+    answer = None
+
+    for key in small_talk:
+        if key in user_input:
+            answer = small_talk[key]
+            break
+
+    with st.chat_message("assistant", avatar=LOGO):
+
+        with st.spinner("AI-Sport is thinking..."):
+
+            if answer is None:
+
+                docs = retriever.invoke(query)
+
+                if len(docs) == 0:
+
+                    answer = "Please consult with your regional head operator for further assistance. I would hate to mislead/misguide you :)"
+
+                else:
+
+                    response = rag_chain.invoke(query)
+                    answer = response.content
+
+            st.markdown(answer)
+
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": answer
+    })

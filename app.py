@@ -1,4 +1,5 @@
 import os
+import io
 import streamlit as st
 from PIL import Image
 
@@ -7,7 +8,7 @@ from PIL import Image
 # ------------------------------
 
 st.set_page_config(
-    page_title="AI-Sport Knowledge Assistant",
+    page_title="AISA Knowledge Assistant",
     layout="wide"
 )
 
@@ -41,10 +42,10 @@ DOCS_PATH = "docs"
 ACCESS_CODE = st.secrets.get("ACCESS_CODE", os.getenv("ACCESS_CODE", ""))
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 
-# Minimum similarity score (FAISS L2 distance — lower is closer) below which we
-# trust a retrieved chunk enough to let the LLM answer from it. Tune this against
-# your own docs; start here and adjust based on what you see logged.
-RELEVANCE_DISTANCE_THRESHOLD = 1.3
+# Chunks are no longer hard-filtered by a raw distance cutoff (see retrieve_relevant
+# below) — the LLM decides relevance itself, guided by the prompt. RETRIEVAL_K is
+# how many candidate chunks it gets to look at per question.
+RETRIEVAL_K = 8
 
 
 # ------------------------------
@@ -55,7 +56,7 @@ RELEVANCE_DISTANCE_THRESHOLD = 1.3
 # "scoreboard") even when the exact words differ.
 
 SYNONYM_MAP = {
-    "graphics": ["overlay", "scoreboard", "score bug", "sss logo", "ads", "banner"],
+    "graphics": ["overlay", "scoreboard", "score bug", "sss logo", "ads", "banner", "advance gfx", "sportvot"],
     "stream": ["video", "feed", "playback", "footage", "vod"],
     "vpu": ["box", "unit", "server", "the machine"],
     "chu": ["camera", "camera head"],
@@ -81,15 +82,40 @@ def expand_query(query: str) -> str:
 # ------------------------------
 # LOAD LOGO
 # ------------------------------
+# Handles the case where "logo.png" is actually a folder containing the real
+# image file (check your file explorer — if logo.png has an expand arrow next
+# to it, it's a directory, not a file, and this is why the direct path fails
+# with a permission error). Tries the direct path first, then falls back to
+# looking for an image file one level inside it.
+
+def _find_logo_path():
+    if os.path.isfile("logo.png"):
+        return "logo.png"
+    if os.path.isdir("logo.png"):
+        for name in os.listdir("logo.png"):
+            if name.lower().endswith((".png", ".jpg", ".jpeg")):
+                return os.path.join("logo.png", name)
+    return None
+
 
 LOGO = None
 
-if os.path.exists("logo.png"):
+logo_path = _find_logo_path()
+
+if logo_path:
     try:
-        LOGO = Image.open("logo.png")
+        with open(logo_path, "rb") as f:
+            LOGO = Image.open(io.BytesIO(f.read()))
+            LOGO.load()
     except (FileNotFoundError, OSError, ValueError) as e:
-        st.warning(f"Couldn't load logo.png: {e}")
+        st.warning(f"Couldn't load {logo_path}: {e}")
         LOGO = None
+elif os.path.exists("logo.png"):
+    st.warning(
+        "'logo.png' exists but is a folder with no image file inside it. "
+        "Move the actual .png/.jpg file directly into the project root and "
+        "name it logo.png, or place it inside the logo.png folder."
+    )
 
 
 # ------------------------------
@@ -102,7 +128,7 @@ if "authenticated" not in st.session_state:
 
 def login():
 
-    st.title("🔐 AI-Sport Secure Access")
+    st.title("🔐 AISA Secure Access")
 
     st.markdown("Enter your company access code to continue.")
 
@@ -125,6 +151,15 @@ if not st.session_state.authenticated:
 
 
 # ------------------------------
+# SIDEBAR / DEBUG TOGGLE
+# ------------------------------
+
+with st.sidebar:
+    st.markdown("### Settings")
+    show_debug = st.checkbox("Show retrieval debug info", value=False)
+
+
+# ------------------------------
 # HEADER / BRANDING
 # ------------------------------
 
@@ -135,8 +170,8 @@ with col1:
         st.image(LOGO, width=120)
 
 with col2:
-    st.title("AI-Sport Knowledge Assistant")
-    st.caption("AI-Sport Internal Support Chatbot")
+    st.title("AISA Knowledge Assistant")
+    st.caption("AI Sport Africa Internal Support Chatbot")
 
 st.divider()
 
@@ -165,9 +200,9 @@ def load_vector_store():
         st.error(f"No PDFs found in '{DOCS_PATH}'. Add at least one PDF and restart.")
         st.stop()
 
-    # Larger chunks + structure-aware separators so that problem/solution table
-    # rows (e.g. "GRAPHICS | No graphics showing | S1 | steps...") land in the
-    # same chunk instead of being sliced apart mid-row.
+    # Larger chunks + structure-aware separators so that problem/solution content
+    # (e.g. "No Graphics on the Stream ... steps...") lands in the same chunk
+    # instead of being sliced apart mid-section.
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1800,
         chunk_overlap=300,
@@ -231,22 +266,27 @@ DOMAIN_NOTES = """
   from its calibrated position, or people/objects in the field of play interfering
   with the tracking algorithm.
 - "Graphics" refers to the overlay shown on the stream: adverts/ads, banners, and
-  the scoreboard.
+  the scoreboard. The graphics provider is branded "Advance GFX" but is still
+  referred to as "SportVot" inside the CMS (under VAS / Overlay Provider).
 - To raise a support ticket, email support@aisport.africa with the system name and
   a description of the issue being faced.
 """.strip()
 
 prompt = ChatPromptTemplate.from_template(
 """
-You are AI-Sport, the internal expert assistant for Pixellot camera systems and
-SportVU overlays. You've effectively configured hundreds of installs and know the
-hardware, the software, and the common failure modes cold. Answer the way a senior
-field technician would talk to a colleague: direct, practical, no filler.
+You are AISA, the internal expert assistant for AI Sport Africa's Pixellot camera
+systems and Advance GFX/SportVot overlays. You've effectively configured hundreds
+of installs and know the hardware, the software, and the common failure modes
+cold. Answer the way a senior field technician would talk to a colleague: direct,
+practical, no filler.
 
 Ground every factual claim in the context below, which combines curated domain
-knowledge and excerpts from the documentation. If the context gives a partial
-answer, say what it covers and be explicit about what it doesn't. If the context
-has nothing relevant to the question, respond with exactly:
+knowledge and excerpts from the documentation. The excerpts are the closest
+matches found by search, but search isn't perfect — some may be irrelevant to
+this specific question. Use only the ones that actually answer it, and ignore
+the rest. If the context gives a partial answer, say what it covers and be
+explicit about what it doesn't. If none of the excerpts and none of the domain
+knowledge actually address the question, respond with exactly:
 "{fallback}"
 
 If the documentation shows different solutions depending on the system type
@@ -289,16 +329,18 @@ rag_chain = (
 )
 
 
-def retrieve_relevant(query, k=6, distance_threshold=RELEVANCE_DISTANCE_THRESHOLD):
-    """Return chunks close enough to the query to be trustworthy context.
+def retrieve_relevant(query, k=RETRIEVAL_K):
+    """Return the k closest chunks, with their distance scores for debugging.
 
-    An empty result here no longer forces the canned fallback — it just means the
-    LLM sees "(no matching documentation excerpts found)" alongside DOMAIN_NOTES
-    and decides from there, so curated domain knowledge can still answer even when
-    the PDFs have nothing relevant.
+    No hard distance cutoff — a numeric threshold was silently discarding
+    genuinely relevant chunks whenever the embedding distance ran a little
+    high on short or loosely-worded queries. The LLM is instructed in the
+    prompt to only use excerpts that actually answer the question and to
+    ignore the rest, so a slightly noisy top-k is safer than a brittle filter
+    that sometimes returns nothing useful at all.
     """
     results = vectorstore.similarity_search_with_score(query, k=k)
-    return [doc for doc, score in results if score <= distance_threshold]
+    return results  # list of (doc, score) tuples
 
 
 # ------------------------------
@@ -330,7 +372,7 @@ for message in st.session_state.messages:
 # CHAT INPUT
 # ------------------------------
 
-query = st.chat_input("Ask AI-Sport about the system...")
+query = st.chat_input("Ask AISA about the system...")
 
 if query:
 
@@ -352,12 +394,12 @@ if query:
     # like "graphics" (contains "hi") or "unthankful" (contains "thank") false-match.
 
     small_talk = {
-        "hi": "Hello! I'm AI-Sport, your internal support assistant. How can I help you today?",
-        "hello": "Hello! How can I assist you with the AI-Sport system today?",
+        "hi": "Hello! I'm AISA, your internal support assistant. How can I help you today?",
+        "hello": "Hello! How can I assist you with the AI Sport Africa system today?",
         "hey": "Hey there! What would you like help with?",
         "thanks": "You're welcome! Let me know if you need anything else.",
         "thank you": "You're welcome! I'm here to help.",
-        "how are you": "I'm running perfectly and ready to help with AI-Sport support questions.",
+        "how are you": "I'm running perfectly and ready to help with AI Sport Africa support questions.",
         "good morning": "Good morning! How can I assist you today?",
         "good afternoon": "Good afternoon! What can I help you with?",
         "good evening": "Good evening! How can I assist you today?"
@@ -366,6 +408,7 @@ if query:
     normalized_input = user_input.rstrip("!.?")
 
     answer = None
+    retrieved = []
 
     for key in small_talk:
         if normalized_input == key:
@@ -374,15 +417,22 @@ if query:
 
     with st.chat_message("assistant", avatar=LOGO):
 
-        with st.spinner("AI-Sport is thinking..."):
+        with st.spinner("AISA is thinking..."):
 
             if answer is None:
 
-                docs = retrieve_relevant(expand_query(query))
+                retrieved = retrieve_relevant(expand_query(query))
+                docs = [doc for doc, score in retrieved]
                 response = rag_chain.invoke({"docs": docs, "question": query})
                 answer = response.content
 
             st.markdown(answer)
+
+            if show_debug and retrieved:
+                with st.expander("Debug: retrieved chunks"):
+                    for doc, score in retrieved:
+                        st.markdown(f"**Score: {score:.3f}** (lower = closer)")
+                        st.code(doc.page_content[:400])
 
     st.session_state.messages.append({
         "role": "assistant",

@@ -42,10 +42,14 @@ DOCS_PATH = "docs"
 ACCESS_CODE = st.secrets.get("ACCESS_CODE", os.getenv("ACCESS_CODE", ""))
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 
-# Chunks are no longer hard-filtered by a raw distance cutoff (see retrieve_relevant
-# below) — the LLM decides relevance itself, guided by the prompt. RETRIEVAL_K is
-# how many candidate chunks it gets to look at per question.
+# Chunks are not hard-filtered by a raw distance cutoff — the LLM decides
+# relevance itself, guided by the prompt. This is how many candidate chunks it
+# gets to look at per question.
 RETRIEVAL_K = 8
+
+# How many previous user/assistant turns to include as conversation context, so
+# the assistant doesn't re-ask a question it already got an answer to.
+MAX_HISTORY_TURNS = 4
 
 
 # ------------------------------
@@ -79,14 +83,45 @@ def expand_query(query: str) -> str:
     return query
 
 
+def build_retrieval_query(current_query: str, prior_messages: list) -> str:
+    """Combine the current message with the last thing AISA said.
+
+    Short replies like "S1" or "connection" are meaningless to a similarity
+    search on their own — they only make sense as an answer to AISA's previous
+    clarifying question. Prepending that question gives the retriever the
+    actual topic to search for.
+    """
+    last_assistant = None
+    for m in reversed(prior_messages):
+        if m["role"] == "assistant":
+            last_assistant = m["content"]
+            break
+
+    if last_assistant:
+        combined = f"{last_assistant} {current_query}"
+    else:
+        combined = current_query
+
+    return expand_query(combined)
+
+
+def build_history_text(messages: list, max_turns: int = MAX_HISTORY_TURNS) -> str:
+    """Render the last few turns as plain text so the LLM has conversational
+    context and doesn't repeat a clarifying question it already asked."""
+    trimmed = messages[-(max_turns * 2):]
+    lines = []
+    for m in trimmed:
+        speaker = "Operator" if m["role"] == "user" else "AISA"
+        lines.append(f"{speaker}: {m['content']}")
+    return "\n".join(lines) if lines else "(no prior messages)"
+
+
 # ------------------------------
 # LOAD LOGO
 # ------------------------------
 # Handles the case where "logo.png" is actually a folder containing the real
-# image file (check your file explorer — if logo.png has an expand arrow next
-# to it, it's a directory, not a file, and this is why the direct path fails
-# with a permission error). Tries the direct path first, then falls back to
-# looking for an image file one level inside it.
+# image file. Tries the direct path first, then falls back to looking for an
+# image file one level inside it.
 
 def _find_logo_path():
     if os.path.isfile("logo.png"):
@@ -151,15 +186,6 @@ if not st.session_state.authenticated:
 
 
 # ------------------------------
-# SIDEBAR / DEBUG TOGGLE
-# ------------------------------
-
-with st.sidebar:
-    st.markdown("### Settings")
-    show_debug = st.checkbox("Show retrieval debug info", value=False)
-
-
-# ------------------------------
 # HEADER / BRANDING
 # ------------------------------
 
@@ -201,8 +227,7 @@ def load_vector_store():
         st.stop()
 
     # Larger chunks + structure-aware separators so that problem/solution content
-    # (e.g. "No Graphics on the Stream ... steps...") lands in the same chunk
-    # instead of being sliced apart mid-section.
+    # lands in the same chunk instead of being sliced apart mid-section.
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1800,
         chunk_overlap=300,
@@ -280,24 +305,26 @@ of installs and know the hardware, the software, and the common failure modes
 cold. Answer the way a senior field technician would talk to a colleague: direct,
 practical, no filler.
 
+Conversation so far (most recent last):
+{{history}}
+
+The operator's latest message may be a short answer to a question YOU asked
+earlier in this conversation (e.g. "S1", "connection"). Read the conversation
+above before deciding what they mean. NEVER ask a clarifying question you have
+already asked and already received an answer to in this conversation — use the
+answer that was given and move the conversation forward. Only ask a NEW
+clarifying question if something is still genuinely missing that hasn't been
+asked yet.
+
 Ground every factual claim in the context below, which combines curated domain
 knowledge and excerpts from the documentation. The excerpts are the closest
 matches found by search, but search isn't perfect — some may be irrelevant to
 this specific question. Use only the ones that actually answer it, and ignore
 the rest. If the context gives a partial answer, say what it covers and be
 explicit about what it doesn't. If none of the excerpts and none of the domain
-knowledge actually address the question, respond with exactly:
+knowledge actually address the question (and there's no unanswered clarifying
+question left to ask), respond with exactly:
 "{fallback}"
-
-If the documentation shows different solutions depending on the system type
-(S1 Mobile, S1 Fixed, S3, SOLO, Cricket) and the question doesn't specify
-which one the operator is using, do not guess. Ask a single, short clarifying
-question naming the system types, e.g. "Which system are you on — S1, S3,
-SOLO, or Cricket?" Only give the fix once you know which applies.
-
-If the question is genuinely ambiguous for another reason (it could reasonably
-mean more than one thing in the docs), ask one short clarifying question rather
-than defaulting to the fallback message.
 
 When you do answer, prefer this shape where it fits:
 1. A one-line diagnosis or direct answer.
@@ -310,7 +337,7 @@ Domain knowledge:
 Documentation excerpts:
 {{context}}
 
-Question:
+Operator's latest message:
 {{question}}
 """.format(fallback=FALLBACK_MESSAGE, domain_notes=DOMAIN_NOTES)
 )
@@ -323,24 +350,23 @@ def format_docs(docs):
 
 
 rag_chain = (
-    {"context": lambda x: format_docs(x["docs"]), "question": lambda x: x["question"]}
+    {
+        "context": lambda x: format_docs(x["docs"]),
+        "question": lambda x: x["question"],
+        "history": lambda x: x["history"],
+    }
     | prompt
     | llm
 )
 
 
 def retrieve_relevant(query, k=RETRIEVAL_K):
-    """Return the k closest chunks, with their distance scores for debugging.
-
-    No hard distance cutoff — a numeric threshold was silently discarding
-    genuinely relevant chunks whenever the embedding distance ran a little
-    high on short or loosely-worded queries. The LLM is instructed in the
-    prompt to only use excerpts that actually answer the question and to
+    """Return the k closest chunks. No hard distance cutoff — the LLM is
+    instructed to only use excerpts that actually answer the question and to
     ignore the rest, so a slightly noisy top-k is safer than a brittle filter
-    that sometimes returns nothing useful at all.
-    """
+    that sometimes silently discards everything useful."""
     results = vectorstore.similarity_search_with_score(query, k=k)
-    return results  # list of (doc, score) tuples
+    return [doc for doc, score in results]
 
 
 # ------------------------------
@@ -376,6 +402,10 @@ query = st.chat_input("Ask AISA about the system...")
 
 if query:
 
+    # Snapshot prior messages BEFORE appending the new one, so history/retrieval
+    # helpers can distinguish "what's already been said" from "what's new".
+    prior_messages = list(st.session_state.messages)
+
     st.session_state.messages.append({
         "role": "user",
         "content": query
@@ -408,7 +438,6 @@ if query:
     normalized_input = user_input.rstrip("!.?")
 
     answer = None
-    retrieved = []
 
     for key in small_talk:
         if normalized_input == key:
@@ -421,20 +450,21 @@ if query:
 
             if answer is None:
 
-                retrieved = retrieve_relevant(expand_query(query))
-                docs = [doc for doc, score in retrieved]
-                response = rag_chain.invoke({"docs": docs, "question": query})
+                retrieval_query = build_retrieval_query(query, prior_messages)
+                docs = retrieve_relevant(retrieval_query)
+                history_text = build_history_text(prior_messages)
+
+                response = rag_chain.invoke({
+                    "docs": docs,
+                    "question": query,
+                    "history": history_text,
+                })
                 answer = response.content
 
             st.markdown(answer)
-
-            if show_debug and retrieved:
-                with st.expander("Debug: retrieved chunks"):
-                    for doc, score in retrieved:
-                        st.markdown(f"**Score: {score:.3f}** (lower = closer)")
-                        st.code(doc.page_content[:400])
 
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer
     })
+    

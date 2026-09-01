@@ -31,9 +31,51 @@ from langchain_groq import ChatGroq
 # ------------------------------
 
 DOCS_PATH = "docs"
-ACCESS_CODE = "company123"
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Access code and API key should live in Streamlit secrets (.streamlit/secrets.toml
+# locally, or the "Secrets" panel on Streamlit Cloud), never hardcoded in source.
+#
+# .streamlit/secrets.toml should contain:
+#   GROQ_API_KEY = "your-groq-key"
+#   ACCESS_CODE = "your-access-code"
+ACCESS_CODE = st.secrets.get("ACCESS_CODE", os.getenv("ACCESS_CODE", ""))
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
+
+# Minimum similarity score (FAISS L2 distance — lower is closer) below which we
+# trust a retrieved chunk enough to let the LLM answer from it. Tune this against
+# your own docs; start here and adjust based on what you see logged.
+RELEVANCE_DISTANCE_THRESHOLD = 1.3
+
+
+# ------------------------------
+# SYNONYM EXPANSION
+# ------------------------------
+# Widens the query with domain terms before it hits FAISS, so operator phrasing
+# ("graphics not showing") matches doc phrasing ("no graphics", "overlay",
+# "scoreboard") even when the exact words differ.
+
+SYNONYM_MAP = {
+    "graphics": ["overlay", "scoreboard", "score bug", "sss logo", "ads", "banner"],
+    "stream": ["video", "feed", "playback", "footage", "vod"],
+    "vpu": ["box", "unit", "server", "the machine"],
+    "chu": ["camera", "camera head"],
+    "sound": ["audio", "mic", "microphone", "static", "buzzing", "humming"],
+    "network": ["internet", "wifi", "connection", "router"],
+    "timer": ["clock", "time", "sync"],
+    "tracking": ["camera not following", "not panning", "not following play"],
+}
+
+
+def expand_query(query: str) -> str:
+    lower = query.lower()
+    extra_terms = set()
+    for term, synonyms in SYNONYM_MAP.items():
+        if term in lower or any(s in lower for s in synonyms):
+            extra_terms.add(term)
+            extra_terms.update(synonyms)
+    if extra_terms:
+        return query + " " + " ".join(sorted(extra_terms))
+    return query
 
 
 # ------------------------------
@@ -45,7 +87,8 @@ LOGO = None
 if os.path.exists("logo.png"):
     try:
         LOGO = Image.open("logo.png")
-    except:
+    except (FileNotFoundError, OSError, ValueError) as e:
+        st.warning(f"Couldn't load logo.png: {e}")
         LOGO = None
 
 
@@ -67,10 +110,11 @@ def login():
 
     if st.button("Login"):
 
-        if access_code == ACCESS_CODE:
+        if not ACCESS_CODE:
+            st.error("No access code configured. Set ACCESS_CODE in Streamlit secrets.")
+        elif access_code == ACCESS_CODE:
             st.session_state.authenticated = True
             st.rerun()
-
         else:
             st.error("Invalid access code")
 
@@ -106,6 +150,10 @@ def load_vector_store():
 
     documents = []
 
+    if not os.path.isdir(DOCS_PATH):
+        st.error(f"Docs folder '{DOCS_PATH}' not found. Create it and add your PDFs.")
+        st.stop()
+
     for file in os.listdir(DOCS_PATH):
 
         if file.endswith(".pdf"):
@@ -113,9 +161,17 @@ def load_vector_store():
             loader = PyPDFLoader(os.path.join(DOCS_PATH, file))
             documents.extend(loader.load())
 
+    if not documents:
+        st.error(f"No PDFs found in '{DOCS_PATH}'. Add at least one PDF and restart.")
+        st.stop()
+
+    # Larger chunks + structure-aware separators so that problem/solution table
+    # rows (e.g. "GRAPHICS | No graphics showing | S1 | steps...") land in the
+    # same chunk instead of being sliced apart mid-row.
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
+        chunk_size=1800,
+        chunk_overlap=300,
+        separators=["\n\n\n", "\n\n", "\n", ". ", " "]
     )
 
     docs = splitter.split_documents(documents)
@@ -135,9 +191,15 @@ def load_vector_store():
 
 def load_llm():
 
+    if not GROQ_API_KEY:
+        st.error("GROQ_API_KEY not set. Add it to Streamlit secrets.")
+        st.stop()
+
     return ChatGroq(
         api_key=GROQ_API_KEY,
-        model="llama-3.3-70b-versatile",
+        # llama-3.3-70b-versatile was decommissioned by Groq (shutdown Aug 16, 2026).
+        # openai/gpt-oss-120b is the recommended replacement; qwen/qwen3.6-27b also works.
+        model="openai/gpt-oss-120b",
         temperature=0
     )
 
@@ -147,8 +209,6 @@ def load_llm():
 # ------------------------------
 
 vectorstore = load_vector_store()
-retriever = vectorstore.as_retriever()
-
 llm = load_llm()
 
 
@@ -156,34 +216,89 @@ llm = load_llm()
 # PROMPT TEMPLATE
 # ------------------------------
 
+FALLBACK_MESSAGE = (
+    "I am not trained to answer this question at the current time. "
+    "Please do reach out to a head operator or raise a ticket with support "
+    "to assist you further."
+)
+
+# Curated domain knowledge that's always available to the assistant, regardless of
+# what the PDF retrieval finds. Add new entries here as you teach the bot more —
+# each one should be a short, self-contained fact or definition.
+DOMAIN_NOTES = """
+- Tracking being off, inaccurate, or not tracking correctly is typically caused by
+  one or more of: calibration being off, the CHU (camera head unit) having moved
+  from its calibrated position, or people/objects in the field of play interfering
+  with the tracking algorithm.
+- "Graphics" refers to the overlay shown on the stream: adverts/ads, banners, and
+  the scoreboard.
+- To raise a support ticket, email support@aisport.africa with the system name and
+  a description of the issue being faced.
+""".strip()
+
 prompt = ChatPromptTemplate.from_template(
 """
-You are AI-Sport, the internal company support assistant.
+You are AI-Sport, the internal expert assistant for Pixellot camera systems and
+SportVU overlays. You've effectively configured hundreds of installs and know the
+hardware, the software, and the common failure modes cold. Answer the way a senior
+field technician would talk to a colleague: direct, practical, no filler.
 
-Answer ONLY using the provided documentation.
+Ground every factual claim in the context below, which combines curated domain
+knowledge and excerpts from the documentation. If the context gives a partial
+answer, say what it covers and be explicit about what it doesn't. If the context
+has nothing relevant to the question, respond with exactly:
+"{fallback}"
 
-If the answer cannot be found in the documents, respond with:
+If the documentation shows different solutions depending on the system type
+(S1 Mobile, S1 Fixed, S3, SOLO, Cricket) and the question doesn't specify
+which one the operator is using, do not guess. Ask a single, short clarifying
+question naming the system types, e.g. "Which system are you on — S1, S3,
+SOLO, or Cricket?" Only give the fix once you know which applies.
 
-"Please consult with your regional head operator for further assistance."
+If the question is genuinely ambiguous for another reason (it could reasonably
+mean more than one thing in the docs), ask one short clarifying question rather
+than defaulting to the fallback message.
 
-Context:
-{context}
+When you do answer, prefer this shape where it fits:
+1. A one-line diagnosis or direct answer.
+2. Concrete steps or facts, in order.
+3. What to check or do next if that doesn't resolve it.
+
+Domain knowledge:
+{domain_notes}
+
+Documentation excerpts:
+{{context}}
 
 Question:
-{question}
-"""
+{{question}}
+""".format(fallback=FALLBACK_MESSAGE, domain_notes=DOMAIN_NOTES)
 )
 
 
 def format_docs(docs):
+    if not docs:
+        return "(no matching documentation excerpts found)"
     return "\n\n".join(doc.page_content for doc in docs)
 
 
 rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    {"context": lambda x: format_docs(x["docs"]), "question": lambda x: x["question"]}
     | prompt
     | llm
 )
+
+
+def retrieve_relevant(query, k=6, distance_threshold=RELEVANCE_DISTANCE_THRESHOLD):
+    """Return chunks close enough to the query to be trustworthy context.
+
+    An empty result here no longer forces the canned fallback — it just means the
+    LLM sees "(no matching documentation excerpts found)" alongside DOMAIN_NOTES
+    and decides from there, so curated domain knowledge can still answer even when
+    the PDFs have nothing relevant.
+    """
+    results = vectorstore.similarity_search_with_score(query, k=k)
+    return [doc for doc, score in results if score <= distance_threshold]
 
 
 # ------------------------------
@@ -227,28 +342,33 @@ if query:
     with st.chat_message("user"):
         st.markdown(query)
 
-    user_input = query.lower()
+    user_input = query.lower().strip()
 
     # ------------------------------
     # SMALL TALK RESPONSES
     # ------------------------------
+    # Matched only when the whole message IS the greeting/phrase (optionally with
+    # trailing punctuation), not just contains it as a substring — otherwise words
+    # like "graphics" (contains "hi") or "unthankful" (contains "thank") false-match.
 
     small_talk = {
         "hi": "Hello! I'm AI-Sport, your internal support assistant. How can I help you today?",
         "hello": "Hello! How can I assist you with the AI-Sport system today?",
         "hey": "Hey there! What would you like help with?",
         "thanks": "You're welcome! Let me know if you need anything else.",
-        "thank": "You're welcome! I'm here to help.",
+        "thank you": "You're welcome! I'm here to help.",
         "how are you": "I'm running perfectly and ready to help with AI-Sport support questions.",
         "good morning": "Good morning! How can I assist you today?",
         "good afternoon": "Good afternoon! What can I help you with?",
         "good evening": "Good evening! How can I assist you today?"
     }
 
+    normalized_input = user_input.rstrip("!.?")
+
     answer = None
 
     for key in small_talk:
-        if key in user_input:
+        if normalized_input == key:
             answer = small_talk[key]
             break
 
@@ -258,16 +378,9 @@ if query:
 
             if answer is None:
 
-                docs = retriever.invoke(query)
-
-                if len(docs) == 0:
-
-                    answer = "Please consult with your regional head operator for further assistance. I would hate to mislead/misguide you :)"
-
-                else:
-
-                    response = rag_chain.invoke(query)
-                    answer = response.content
+                docs = retrieve_relevant(expand_query(query))
+                response = rag_chain.invoke({"docs": docs, "question": query})
+                answer = response.content
 
             st.markdown(answer)
 
